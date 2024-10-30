@@ -25,6 +25,10 @@ import transformers.pytorch_utils
 from torch import nn
 from torch.functional import F
 from transformers.models.t5.modeling_t5 import T5LayerNorm
+import sys
+# caution: path[0] is reserved for script path (or '' in REPL)
+sys.path.insert(1, '/home/shubhankar.mohapatra/DP-MicroDIT/micro_diffusion/models')
+from dit import D3LinearLayer
 
 
 def mixed_ghost_norm(layer,A,B,conv=False):
@@ -63,6 +67,15 @@ def _light_linear_weight_norm_sample(A, B) -> torch.Tensor:
     else:
         raise ValueError(f"Unexpected input shape: {A.size()}, grad_output shape: {B.size()}")
 
+def _light_3Dlinear_weight_norm_sample(A, B) -> torch.Tensor:
+    """Compute gradient sample norm for the weight matrix in a linear layer."""
+    if A.dim() == 3 and B.dim() == 3:
+        return _light_3Dlinear_weight_norm_sample_non_sequential(A, B)
+    elif A.dim() == 4 and B.dim() == 4:
+        return _light_3Dlinear_weight_norm_sample_sequential(A, B)
+    else:
+        raise ValueError(f"Unexpected input shape: {A.size()}, grad_output shape: {B.size()}")
+
 
 @torch.jit.script
 def _light_linear_weight_norm_sample_sequential(A, B):
@@ -73,11 +86,25 @@ def _light_linear_weight_norm_sample_sequential(A, B):
     #return torch.sqrt((torch.einsum('bTd,bSd->bTS',A,A)*torch.einsum('bTp,bSp->bTS',B,B)).sum(dim=(1, 2)))
     return torch.sqrt((torch.bmm(A, A.transpose(-1, -2)) * torch.bmm(B, B.transpose(-1, -2))).sum(dim=(1, 2)))
 
+@torch.jit.script
+def _light_3Dlinear_weight_norm_sample_sequential(A, B):
+    """Lightweight norm computation in ghost clipping.
+
+    Linear algebra identity trick -- Eq. 3 in the paper.
+    """
+    #return torch.sqrt((torch.einsum('bTd,bSd->bTS',A,A)*torch.einsum('bTp,bSp->bTS',B,B)).sum(dim=(1, 2)))
+    return torch.sqrt((torch.matmul(A, A.transpose(-1, -2)) * torch.matmul(B, B.transpose(-1, -2))).sum(dim=(1, 2, 3)))
+
 
 @torch.jit.script
 def _light_linear_weight_norm_sample_non_sequential(A, B):
     """The Goodfellow trick, i.e., Frobenius norm equal to product of 2-norms."""
     return A.norm(2, dim=1) * B.norm(2, dim=1)
+
+@torch.jit.script
+def _light_3Dlinear_weight_norm_sample_non_sequential(A, B):
+    """The Goodfellow trick, i.e., Frobenius norm equal to product of 2-norms."""
+    return A.norm(2, dim=(1,2)) * B.norm(2, dim=(1,2))
 
 @torch.jit.script
 def _light_linear_bias_norm_sample(B):
@@ -121,7 +148,42 @@ def _compute_linear_grad_sample(layer: nn.Linear, A: torch.Tensor, B: torch.Tens
             grad_bias = B.sum(dim=1)
         elif B.dim() == 2:
             grad_bias = B
-        layer.bias.grad_sample = grad_bias.detach()     
+        layer.bias.grad_sample = grad_bias.detach()
+
+def _compute_3Dlinear_grad_sample(layer: nn.Linear, A: torch.Tensor, B: torch.Tensor, clipping_mode: str) -> None:
+    """Computes per sample gradients for `nn.Linear` layer.
+    A is activations or layer's input, see autograd_grad_sample line 229; B is output gradient
+    This function is written in an unusually bespoke way to avoid using `torch.einsum`.
+    """
+    if A!=None:
+        if clipping_mode in ['MixGhostClip','MixOpt']:
+            mixed_ghost_norm(layer, A, B)
+        else:
+            layer.use_gc=True
+        
+        if A.dim()>4:
+            A=torch.flatten(A,start_dim=1,end_dim=-3)
+            B=torch.flatten(B,start_dim=1,end_dim=-3)
+            
+        if layer.use_gc==True:
+            #--- compute weight gradient norm
+            layer.weight.norm_sample = _light_3Dlinear_weight_norm_sample(A, B)
+        else:
+            raise NotImplementedError
+            ## Or use Line 105 (v0.1.0) https://github.com/lxuechen/private-transformers/blob/main/private_transformers/privacy_utils/supported_layers_grad_samplers.py
+            # layer.weight.grad_sample = torch.einsum('b...d, b...p-> bpd', A, B).detach()
+            # layer.weight.norm_sample = torch.sqrt(torch.sum(layer.weight.grad_sample**2, dim=(1, 2)))
+            # if clipping_mode!='MixOpt':
+            #     del layer.weight.grad_sample
+    
+    #--- compute bias gradient norm
+    if layer.bias is not None:
+        layer.bias.norm_sample = _light_linear_bias_norm_sample(B)
+        if B.dim() == 3:
+            grad_bias = B.sum(dim=1)
+        elif B.dim() == 2:
+            grad_bias = B
+        layer.bias.grad_sample = grad_bias.detach()  
 
 
 def _compute_Conv1D_grad_sample(layer: nn.Linear, A: torch.Tensor, B: torch.Tensor, clipping_mode: str) -> None:
@@ -302,6 +364,14 @@ def _clip_linear_grad(layer: nn.Linear, A: torch.Tensor, B: torch.Tensor, C) -> 
         grad_weight = torch.einsum('b...d,b...p->pd',A,B)
     return grad_weight
 
+def _clip_3Dlinear_grad(layer: nn.Linear, A: torch.Tensor, B: torch.Tensor, C) -> None:
+    try:
+        grad_weight = torch.einsum('b...,b->...',layer.weight.grad_sample,C)
+        del layer.weight.grad_sample
+    except:
+        grad_weight = torch.einsum('bn...d,bn...p->ndp',A,B)
+    return grad_weight
+
 def _clip_normalization_grad(layer, A: torch.Tensor, B: torch.Tensor, C) -> None:
     grad_weight = torch.einsum('b...,b->...',layer.weight.grad_sample,C)
     del layer.weight.grad_sample
@@ -362,6 +432,7 @@ def _clip_t5_layer_norm_grad(layer: T5LayerNorm, A: torch.Tensor, B: torch.Tenso
 
 _supported_layers_norm_sample_AND_clipping = {
     nn.Embedding: (_compute_embedding_grad_sample, _clip_embedding_grad),
+    D3LinearLayer: (_compute_3Dlinear_grad_sample, _clip_3Dlinear_grad),
     nn.Linear: (_compute_linear_grad_sample, _clip_linear_grad),
     nn.Conv1d: (_compute_conv_grad_sample, _clip_conv_grad),
     nn.Conv2d: (_compute_conv_grad_sample, _clip_conv_grad),
