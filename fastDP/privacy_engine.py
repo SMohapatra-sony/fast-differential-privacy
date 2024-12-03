@@ -137,6 +137,8 @@ class PrivacyEngine(object):
         self.eps_error = eps_error
         self.accounting_mode = accounting_mode
         self.record_snr = record_snr
+        self.num_GPUs = num_GPUs
+        self.torch_seed_is_fixed = torch_seed_is_fixed
 
         # Internals.
         self.steps = 0  # Tracks privacy spending.
@@ -305,6 +307,7 @@ class PrivacyEngine(object):
                 self.overlapping_partition_gradients_reduce_epilogue()
     
             DeepSpeedZeroOptimizer.reduce_gradients = reduce_gradients_DP_stage_1
+            print('>>>>>>>>>>>>>>>>> DeepSpeedZeroOptimizer.reduce_gradients is modified for DP-SGD.')
         except:
             pass
 
@@ -366,7 +369,41 @@ class PrivacyEngine(object):
               if hasattr(param,'private_grad'):
                 del param.private_grad
 
-                    
+    def update_clip(self, clip):
+        """Update clipping threshold."""
+        print('>>>>>>>>>>>>>>>>> Previous clip ', self.max_grad_norm)
+        self.max_grad_norm = clip
+
+        #update new parameters
+        if self.clipping_style=='layer-wise':
+            self.max_grad_norm_layerwise = self.max_grad_norm / math.sqrt(self.n_layers)
+        elif self.clipping_style=='param-wise':
+            self.max_grad_norm_layerwise = self.max_grad_norm / math.sqrt(self.n_components)
+        elif self.clipping_style=='all-layer':
+            self.max_grad_norm_layerwise=self.max_grad_norm
+        else:
+            self.max_grad_norm_layerwise=self.max_grad_norm / math.sqrt(len(self.clipping_style))
+
+        for name,param in self.module.named_parameters():
+            param.batch_size = self.batch_size
+            if self.torch_seed_is_fixed == True:
+                param.noise = self.noise_multiplier*self.max_grad_norm / self.num_GPUs
+            else:
+                param.noise = self.noise_multiplier*self.max_grad_norm / math.sqrt(self.num_GPUs)
+        
+        #remove previous hooks
+        autograd_grad_sample.remove_hooks(self.module)
+
+        #add new hooks
+        autograd_grad_sample.add_hooks(model=self.module, loss_reduction=self.loss_reduction, 
+                                       clipping_mode=self.clipping_mode, bias_only=self.bias_only,
+                                       clipping_style=self.clipping_style, block_heads=self.block_heads,
+                                       named_params=self.named_params, named_layers=self.named_layers,
+                                       clipping_fn=self.clipping_fn, 
+                                       numerical_stability_constant=self.numerical_stability_constant,
+                                       max_grad_norm_layerwise=self.max_grad_norm_layerwise)
+
+        print('>>>>>>>>>>>>>>>>> New clip ', self.max_grad_norm)
     def _create_noisy_clipped_gradient(self):
         """Create noisy clipped gradient for `optimizer.step`."""
         
@@ -443,7 +480,6 @@ class PrivacyEngine(object):
                 )
                 if not lenient:
                     raise err
-
         return privacy_results
 
     def get_training_stats(self):
